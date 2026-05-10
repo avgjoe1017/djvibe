@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "vibedj start" }] }
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "vibedj run" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "vibedj run" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "vibedj idle" }] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "vibedj idle" }] }
+    ]
+  }
+}

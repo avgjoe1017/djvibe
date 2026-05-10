@@ -1,0 +1,11 @@
+# Local-only Claude Code context — kept out of public repo
+CLAUDE.md
+.claude/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor cruft
+*.swp
+*~

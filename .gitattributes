@@ -1,0 +1,5 @@
+# Force LF line endings for shell scripts so they keep working on
+# Linux/macOS even when committed from a Windows host.
+vibedj      text eol=lf
+install.sh  text eol=lf
+*.sh        text eol=lf

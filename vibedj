@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# vibedj — DJ for AI agents
+# Plays podcasts/audiobooks while the LLM is running.
+# Crossfades to ambient when it's your turn to think.
+
+set -euo pipefail
+
+VIBEDJ_DIR="${VIBEDJ_DIR:-$HOME/.vibedj}"
+PODCAST_DIR="$VIBEDJ_DIR/podcast"
+AMBIENT_DIR="$VIBEDJ_DIR/ambient"
+LOG_FILE="$VIBEDJ_DIR/vibedj.log"
+
+PODCAST_SOCK="/tmp/vibedj-podcast.sock"
+AMBIENT_SOCK="/tmp/vibedj-ambient.sock"
+PODCAST_PID="/tmp/vibedj-podcast.pid"
+AMBIENT_PID="/tmp/vibedj-ambient.pid"
+STATE_FILE_RT="/tmp/vibedj.state"
+
+TARGET_VOLUME="${VIBEDJ_VOLUME:-65}"
+AMBIENT_VOLUME="${VIBEDJ_AMBIENT_VOLUME:-40}"
+FADE_MS="${VIBEDJ_FADE_MS:-1200}"
+FADE_STEPS=12
+
+mkdir -p "$VIBEDJ_DIR"
+
+log() { echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE"; }
+
+current_state() {
+  [ -f "$STATE_FILE_RT" ] && cat "$STATE_FILE_RT" || echo "unknown"
+}
+
+set_state() {
+  echo "$1" > "$STATE_FILE_RT"
+}
+
+# --- mpv IPC helpers -------------------------------------------------------
+
+mpv_send() {
+  local sock="$1" cmd="$2"
+  [ -S "$sock" ] || return 0
+  echo "$cmd" | socat - "UNIX-CONNECT:$sock" 2>/dev/null || true
+}
+
+mpv_set_volume() {
+  mpv_send "$1" "{\"command\":[\"set_property\",\"volume\",$2]}"
+}
+
+mpv_pause() {
+  mpv_send "$1" "{\"command\":[\"set_property\",\"pause\",$2]}"
+}
+
+mpv_running() {
+  local pidfile="$1"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+fade_volume() {
+  local sock="$1" from="$2" to="$3"
+  local step_sleep
+  step_sleep=$(awk "BEGIN { print $FADE_MS / $FADE_STEPS / 1000 }")
+  local i vol
+  for i in $(seq 1 $FADE_STEPS); do
+    vol=$(awk "BEGIN { print int($from + ($to - $from) * $i / $FADE_STEPS) }")
+    mpv_set_volume "$sock" "$vol"
+    sleep "$step_sleep"
+  done
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_start() {
+  mkdir -p "$PODCAST_DIR" "$AMBIENT_DIR"
+
+  if ! command -v mpv >/dev/null; then
+    echo "mpv not found. install with: brew install mpv socat" >&2
+    exit 1
+  fi
+  if ! command -v socat >/dev/null; then
+    echo "socat not found. install with: brew install socat" >&2
+    exit 1
+  fi
+
+  # Start podcast player (paused, plays through directory in order)
+  if ! mpv_running "$PODCAST_PID"; then
+    rm -f "$PODCAST_SOCK"
+    mpv \
+      --idle=yes \
+      --no-video \
+      --input-ipc-server="$PODCAST_SOCK" \
+      --volume=0 \
+      --pause \
+      --keep-open=yes \
+      --save-position-on-quit \
+      --watch-later-directory="$VIBEDJ_DIR/.watch-later" \
+      "$PODCAST_DIR" \
+      >/dev/null 2>&1 &
+    echo $! > "$PODCAST_PID"
+    log "started podcast mpv pid=$!"
+  fi
+
+  # Start ambient player (paused, looping & shuffling)
+  if ! mpv_running "$AMBIENT_PID"; then
+    rm -f "$AMBIENT_SOCK"
+    mpv \
+      --idle=yes \
+      --no-video \
+      --loop-playlist=inf \
+      --shuffle \
+      --input-ipc-server="$AMBIENT_SOCK" \
+      --volume=0 \
+      --pause \
+      "$AMBIENT_DIR" \
+      >/dev/null 2>&1 &
+    echo $! > "$AMBIENT_PID"
+    log "started ambient mpv pid=$!"
+  fi
+
+  # Wait for sockets to come up
+  for _ in $(seq 1 20); do
+    [ -S "$PODCAST_SOCK" ] && [ -S "$AMBIENT_SOCK" ] && break
+    sleep 0.1
+  done
+
+  cmd_idle
+}
+
+cmd_run() {
+  # Agent is working. Spoken content on, ambient out.
+  [ "$(current_state)" = "run" ] && return 0
+  mpv_running "$PODCAST_PID" || cmd_start
+  set_state "run"
+  log "→ run"
+  mpv_pause "$PODCAST_SOCK" false
+  fade_volume "$AMBIENT_SOCK" "$AMBIENT_VOLUME" 0 &
+  fade_volume "$PODCAST_SOCK" 0 "$TARGET_VOLUME"
+  wait
+  mpv_pause "$AMBIENT_SOCK" true
+}
+
+cmd_idle() {
+  # Your turn to think. Ambient on, spoken out.
+  [ "$(current_state)" = "idle" ] && return 0
+  mpv_running "$AMBIENT_PID" || cmd_start
+  set_state "idle"
+  log "→ idle"
+  mpv_pause "$AMBIENT_SOCK" false
+  fade_volume "$PODCAST_SOCK" "$TARGET_VOLUME" 0 &
+  fade_volume "$AMBIENT_SOCK" 0 "$AMBIENT_VOLUME"
+  wait
+  mpv_pause "$PODCAST_SOCK" true
+}
+
+cmd_stop() {
+  log "stopping"
+  for pidfile in "$PODCAST_PID" "$AMBIENT_PID"; do
+    if [ -f "$pidfile" ]; then
+      kill "$(cat "$pidfile")" 2>/dev/null || true
+      rm -f "$pidfile"
+    fi
+  done
+  rm -f "$PODCAST_SOCK" "$AMBIENT_SOCK" "$STATE_FILE_RT"
+}
+
+cmd_status() {
+  echo "state: $(current_state)"
+  if mpv_running "$PODCAST_PID"; then
+    echo "podcast: running (pid $(cat "$PODCAST_PID"))"
+  else
+    echo "podcast: stopped"
+  fi
+  if mpv_running "$AMBIENT_PID"; then
+    echo "ambient: running (pid $(cat "$AMBIENT_PID"))"
+  else
+    echo "ambient: stopped"
+  fi
+  echo "podcast files: $(find "$PODCAST_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  echo "ambient files: $(find "$AMBIENT_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+}
+
+cmd_next()  { mpv_send "$PODCAST_SOCK" '{"command":["playlist-next"]}'; }
+cmd_prev()  { mpv_send "$PODCAST_SOCK" '{"command":["playlist-prev"]}'; }
+cmd_skip()  { mpv_send "$PODCAST_SOCK" '{"command":["seek",30]}'; }
+cmd_back()  { mpv_send "$PODCAST_SOCK" '{"command":["seek",-15]}'; }
+
+case "${1:-}" in
+  start)  cmd_start ;;
+  stop)   cmd_stop ;;
+  run)    cmd_run ;;
+  idle)   cmd_idle ;;
+  status) cmd_status ;;
+  next)   cmd_next ;;
+  prev)   cmd_prev ;;
+  skip)   cmd_skip ;;
+  back)   cmd_back ;;
+  *)
+    cat <<EOF
+vibedj — DJ for AI agents
+
+Usage:
+  vibedj start    start audio engine (idempotent)
+  vibedj stop     stop audio engine
+  vibedj run      transition to "agent working" (podcast on, ambient out)
+  vibedj idle     transition to "your turn to think" (ambient on, podcast out)
+  vibedj status   show what's playing
+  vibedj next     skip to next podcast track
+  vibedj prev     previous podcast track
+  vibedj skip     seek +30s in podcast
+  vibedj back     seek -15s in podcast
+
+Drop audio files into:
+  $PODCAST_DIR
+  $AMBIENT_DIR
+
+Env:
+  VIBEDJ_VOLUME           podcast playback volume (0-100, default 65)
+  VIBEDJ_AMBIENT_VOLUME   ambient playback volume (0-100, default 40)
+  VIBEDJ_FADE_MS          crossfade duration ms (default 1200)
+EOF
+    exit 1
+    ;;
+esac
